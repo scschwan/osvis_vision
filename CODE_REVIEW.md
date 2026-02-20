@@ -642,3 +642,239 @@ osvis_vision/
 | Edge Margin | 5px | `bush_inspector.py:216` | 경계 접촉 판정 여유 |
 | Corner Proximity | 40px | `bush_inspector.py:515` | 코너 간섭 판정 거리 |
 | 밝기 임계값 | 200 | `bush_inspector.py:390` | TOP/BOT 구분 기준 |
+
+---
+
+## 11. 추가 개선 사항 (Roadmap)
+
+### 11.1 딥러닝 기반 Bush 제품 검출
+
+#### As-Is (현재)
+
+현재 시스템은 `product_config.json`에 정의된 **Rule 기반 파라미터**(면적, 종횡비, 변 길이, 엣지 길이 합 등)로 제품을 분류한다.
+
+```
+현재 검출 흐름:
+  이미지 → Threshold → Contour 검출 → 면적/크기 필터 → 텍스트 Blob 검출 → 방향 결정
+                                        ↑
+                              product_config.json의 규칙 기반 파라미터
+```
+
+**한계점**:
+- #1~#25 제품 중 **동일한 외형 형질**(면적, 종횡비, 크기 등)을 가진 제품 간 구분 불가
+- 새로운 제품 추가 시 수동으로 파라미터를 튜닝해야 하며, 기존 제품과 겹치는 파라미터 범위가 있으면 오분류 발생
+- 표면의 미세 패턴, 각인, 색상 차이 등 고차원 특징을 활용하지 못함
+- `check_surface_type()`이 단순 밝기 평균(< 200)에 의존하여 조명 조건 변화에 취약
+
+#### To-Be (개선안)
+
+딥러닝 객체 감지(Object Detection) 모델을 도입하여 **#1~#25 전체 제품을 정확히 분류**한다.
+
+```
+개선 검출 흐름:
+  이미지 → DL 모델 추론 → [class_id, bbox, confidence] → 후처리
+                ↑
+        학습된 모델 (25-class classification)
+```
+
+**권장 접근 방식**:
+
+| 항목 | 내용 |
+|------|------|
+| **모델** | YOLOv8/v11 (프로젝트에 이미 `ultralytics` 의존성 존재) 또는 RT-DETR |
+| **Task** | Object Detection (25-class) + Surface Classification (TOP/BOT) |
+| **학습 데이터** | 기존 `original/`, `result/` 디렉토리에 축적된 검사 이미지 활용 |
+| **추론 환경** | OpenVINO (이미 `openvino` 의존성 존재) 또는 TensorRT로 최적화 |
+| **Fallback** | DL 모델 confidence가 낮을 경우 기존 Rule 기반 로직으로 대체 (Hybrid 방식) |
+
+**예상 변경 범위**:
+
+```
+bush_inspector.py:
+  - 신규 클래스: DLBushClassifier
+    - load_model(): ONNX/OpenVINO 모델 로드
+    - predict(image): 추론 실행 → (class_id, bbox, confidence) 리스트 반환
+  - process_image() 수정:
+    - DL 추론 → 검출 결과에서 class_id로 product 매핑
+    - confidence threshold 이하 → 기존 Rule 기반 fallback
+
+main_app.py:
+  - InspectionSystem.__init__(): DLBushClassifier 초기화
+  - process_inspection_scenario(): DL 결과 우선, Rule 기반 보조
+
+main_ui.py:
+  - Config Tab: 모델 경로, confidence threshold 설정 UI 추가
+  - Result Table: class_id, confidence 컬럼 추가
+
+product_config.json:
+  - 각 제품에 dl_class_name, confidence_threshold 필드 추가
+```
+
+**데이터 수집/라벨링 전략**:
+1. 기존 시스템에서 축적된 검사 이미지를 활용 (이미 제품별로 분류 가능한 메타데이터 존재)
+2. `visualize_result()`에서 생성하는 결과 이미지의 bbox 정보를 YOLO 라벨 포맷으로 자동 변환하는 유틸리티 작성
+3. 초기 학습 → 현장 배포 → 오분류 케이스 수집 → 재학습 (Active Learning 사이클)
+
+---
+
+### 11.2 Picking 정위치 검증 비전 모듈
+
+#### 배경
+
+현재 시스템은 부품의 **위치(x, y)와 각도(angle), 방향(direction)**을 로봇에 전달하고, 로봇이 해당 좌표로 이동하여 picking을 수행한다. 그러나 picking 후 부품이 picker 중앙에 정확히 위치했는지 검증하는 단계가 없다.
+
+#### 개선안: 하단 검증 카메라 시스템
+
+```
+                    ┌──────────┐
+                    │  Picker  │
+                    │  (흡착)  │
+                    └────┬─────┘
+                         │ 부품
+                         ▼
+              ┌──────────────────────┐
+              │  Ring Light (하단용)  │
+              │  ┌────────────────┐  │
+              │  │ 검증 카메라     │  │
+              │  │ (하단 설치)     │  │
+              │  └────────────────┘  │
+              └──────────────────────┘
+```
+
+**시스템 구성**:
+
+| 구성요소 | 사양 (권장) | 용도 |
+|----------|------------|------|
+| 카메라 | Basler ace2 (동일 라인업) | 하단에서 picker 촬영 |
+| 조명 | Ring Light 또는 Backlight | 부품 윤곽 강조 |
+| 마운트 | Picker 이동 경로 하단 고정 | Picking → 조립 사이 경유 |
+
+**검증 알고리즘**:
+
+```
+1. Picker가 부품을 picking한 후 검증 포인트로 이동
+2. 하단 카메라로 이미지 캡처
+3. 검증 처리:
+   a. Picker 중심 좌표 (기계적 고정값) 대비 부품 중심 오프셋 계산
+   b. 부품 회전 각도 오차 계산
+   c. 허용 오차 범위 판정:
+      - 위치 오차: ±Δx, ±Δy (mm)
+      - 각도 오차: ±Δθ (degree)
+4. 판정 결과:
+   - PASS: 조립 공정 진행
+   - OFFSET: 오프셋 보정값 전달 → 로봇이 보정 후 조립
+   - FAIL: Re-picking 또는 부품 폐기
+```
+
+**예상 아키텍처 변경**:
+
+```
+신규 모듈:
+  picking_verifier.py
+    - PickingVerifier 클래스
+    - verify_picking(image) → (status, offset_x, offset_y, angle_error)
+
+camera_module.py 수정:
+  - CameraController를 멀티 카메라 지원으로 확장
+  - 또는 별도의 VerificationCameraController 인스턴스 생성
+
+vision_server.py 수정:
+  - 신규 명령어 추가: #VERIFY; → 검증 실행
+  - 응답: #VERIFY_OK,offset_x,offset_y,angle_err;
+         #VERIFY_FAIL,reason;
+
+main_ui.py 수정:
+  - Main Monitor에 검증 카메라 이미지 영역 추가
+  - 검증 결과 표시 (PASS/OFFSET/FAIL)
+```
+
+**통신 프로토콜 확장**:
+
+| 명령어 | 방향 | 용도 |
+|--------|------|------|
+| `#VERIFY;` | Client → Server | Picking 검증 요청 |
+| `#VERIFY_OK,dx,dy,da;` | Server → Client | 검증 통과 (보정값 포함) |
+| `#VERIFY_NG,reason;` | Server → Client | 검증 실패 |
+
+---
+
+### 11.3 조립 완제품 Crack/불량 검사
+
+#### 배경
+
+현재 시스템은 **조립 전 개별 부품**(Bush)의 위치/방향 검출에 특화되어 있다. 상/하단 커버까지 조립이 완료된 **완제품의 표면 불량**(Crack, 스크래치, 이물질 등) 검사는 별도 시스템이 필요하다.
+
+#### 검토 항목
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    완제품 불량 유형                           │
+├─────────────────┬───────────────────────────────────────────┤
+│ Crack (균열)    │ 조립 압력에 의한 미세 균열, 사출 불량       │
+│ Scratch (긁힘)  │ 이송/조립 과정 중 표면 손상                │
+│ Burr (버)       │ 사출 잔여물, 조립 면 돌출                  │
+│ Gap (틈새)      │ 상/하단 커버 결합 불량, 들뜸                │
+│ 이물질          │ 표면 오염, 먼지, 유분                      │
+│ 변색/얼룩       │ 사출 온도 불균일에 의한 색상 차이            │
+└─────────────────┴───────────────────────────────────────────┘
+```
+
+#### 권장 접근 방식: Anomaly Detection
+
+완제품 불량은 **정상 샘플 대비 이상 패턴**을 검출하는 방식이 적합하다. 불량 유형이 다양하고 불량 샘플 수집이 어렵기 때문이다.
+
+**후보 기술**:
+
+| 기술 | 장점 | 단점 | 적합도 |
+|------|------|------|--------|
+| **AnomalyDetection (PatchCore, EfficientAD 등)** | 정상 샘플만으로 학습 가능, 불량 유형 사전 정의 불필요 | 미세 결함 민감도 튜닝 필요 | 높음 |
+| **Segmentation (U-Net 등)** | 불량 영역 정밀 마킹 가능 | 충분한 불량 라벨 데이터 필요 | 중간 |
+| **Rule 기반 (Canny + Hough)** | 구현 간단, 추가 학습 불필요 | Crack 유형별 규칙 작성 필요, 유연성 낮음 | 낮음 |
+
+**Anomaly Detection 파이프라인**:
+
+```
+정상 완제품 이미지 수집 (N장)
+         │
+         ▼
+  Feature Extraction (Pretrained CNN backbone)
+         │
+         ▼
+  Memory Bank 구축 (PatchCore) 또는 Teacher-Student 학습 (EfficientAD)
+         │
+         ▼
+  ┌─── 검사 시 ────────────────────────────┐
+  │                                        │
+  │  완제품 이미지 캡처                      │
+  │       │                                │
+  │       ▼                                │
+  │  Feature 추출 → Memory Bank와 비교      │
+  │       │                                │
+  │       ▼                                │
+  │  Anomaly Score Map 생성                 │
+  │       │                                │
+  │       ▼                                │
+  │  Score > Threshold → 불량 검출 + 위치   │
+  │  Score ≤ Threshold → 정상 판정          │
+  └────────────────────────────────────────┘
+```
+
+**하드웨어 요구 사항**:
+
+| 구성요소 | 권장 사양 | 비고 |
+|----------|----------|------|
+| 카메라 | 고해상도 (5MP+) Area Scan | 미세 Crack 검출을 위해 현재보다 높은 해상도 필요 |
+| 조명 | 다방향 조명 (Dome Light 또는 Multi-angle) | 표면 결함은 조명 각도에 민감. 단일 조명으로는 검출률 한계 |
+| 스테이지 | 회전 스테이지 또는 다면 촬영 지그 | 완제품 전면 검사를 위해 다각도 촬영 필요 |
+| GPU | NVIDIA (추론용, 옵션) | OpenVINO CPU 추론도 가능하나 처리 속도 고려 |
+
+**검토 필요 사항**:
+
+| # | 항목 | 내용 |
+|---|------|------|
+| 1 | 검사 기준 정의 | 허용 Crack 크기(μm), 위치별 허용 기준 등 품질 스펙 확정 필요 |
+| 2 | 조명 환경 설계 | Crack 유형(표면/관통/헤어라인)별 최적 조명 방식 PoC 필요 |
+| 3 | Tact Time | 현재 검사 사이클(~2초) 대비 추가 검사 시간 허용 범위 확인 |
+| 4 | 정상 샘플 확보 | Anomaly Detection 학습을 위한 정상 완제품 이미지 최소 200~500장 |
+| 5 | 기존 시스템 통합 vs 독립 | 현 시스템에 모듈 추가 vs 별도 검사 스테이션 구축 결정 |
+| 6 | 판정 기준 검증 | 과검출(False Positive) 비율 vs 미검출(False Negative) 비율의 트레이드오프 합의 |
