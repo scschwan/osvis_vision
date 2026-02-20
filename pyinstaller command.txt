@@ -1,0 +1,2 @@
+one file 방식 : pyinstaller -n "VisionSystem" --clean --noconsole --onefile main_ui.py
+one dir 방식(배포용) : pyinstaller -n "VisionSystem_Dir" --clean --noconsole main_ui.py

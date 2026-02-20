@@ -1,0 +1,14 @@
+{
+    "pixel_to_mm": 0.028761,
+    "max_retry_count": 3,
+    "bush_min_area": 143000,
+    "bush_max_area": 150000,
+    "thresh_block_size": 15,
+    "thresh_c": 3.0,
+    "min_center_dist_mm": 13.0,
+    "canny_thresh1": 30,
+    "canny_thresh2": 100,
+    "canny_blur_size": 3,
+    "side_corner_except_dist": 70.0,
+    "simple_thresh_val": 125
+}

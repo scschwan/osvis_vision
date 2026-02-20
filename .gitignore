@@ -1,0 +1,11 @@
+__pycache__/*
+dist/*
+result_python/*
+log/*
+img_ori/*
+venvVision/*
+build/*
+1st result/*
+images/*
+result_python_blob_tuned/*
+global_config.zip
